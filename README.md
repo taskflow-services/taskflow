@@ -5,6 +5,8 @@ TaskFlow is a REST API for managing a to-do list, built with Spring Boot. You ca
 - Anyone can read tasks. Creating and updating tasks requires a login, and deleting requires an admin login.
 - Each time a task is created, TaskFlow publishes a `task-created` event to a JMS message queue that other services can listen to.
 - TaskFlow registers itself with a Eureka server so other services can discover it.
+- Shared settings come from a Spring Cloud Config server, and some of them can be changed while TaskFlow is running, without a restart.
+- Every request gets a correlation ID that appears in the logs and travels with the task-created event.
 
 Tasks and users are stored in an in-memory H2 database, so **all data is lost when the application stops**.
 
@@ -13,6 +15,7 @@ Tasks and users are stored in an in-memory H2 database, so **all data is lost wh
 ```mermaid
 flowchart LR
     client["API client<br/>(curl, browser, another app)"]
+    gateway["API gateway<br/>:8082"]
 
     subgraph app["TaskFlow process"]
         api["TaskFlow REST API<br/>:8080"]
@@ -20,25 +23,35 @@ flowchart LR
         broker["Embedded Artemis broker<br/>queue: task.created.queue<br/>:61616"]
     end
 
-    consumer["Notification service<br/>or any JMS consumer<br/>(not in this repo)"]
-    eureka["Eureka server<br/>:8761<br/>(not in this repo)"]
+    consumer["Notification service<br/>:8081"]
+    eureka["Eureka server<br/>:8761"]
+    config["Config server<br/>:8888"]
+    rabbit["RabbitMQ<br/>:5672"]
+    zipkin["Zipkin<br/>:9411"]
 
-    client -- "HTTP + Basic auth" --> api
+    client -- "HTTP + Basic auth" --> gateway
+    client -. "or directly" .-> api
+    gateway -- "/tasks/**" --> api
     api -- "JPA" --> h2
     api -- "task-created event<br/>after POST /tasks" --> broker
     broker -- "JMS over TCP" --> consumer
     api -. "register + heartbeat" .-> eureka
+    api -. "settings at startup<br/>and on refresh" .-> config
+    api <-. "refresh events<br/>(Spring Cloud Bus)" .-> rabbit
+    api -. "trace spans" .-> zipkin
 ```
 
 - **H2** and the **Artemis broker** run inside the TaskFlow process, so nothing else needs to be installed for them.
 - The broker also listens on TCP port **61616**, so other services can connect to it and read from `task.created.queue`.
-- The **notification service** and the **Eureka server** are separate applications that aren't part of this repository. TaskFlow keeps working without them. See [Running without the other services](#running-without-the-other-services).
+- Everything outside the TaskFlow box is a separate application that isn't part of this repository. The API gateway, notification service, Eureka server and config server each have their own project. RabbitMQ and Zipkin are installed separately.
+- The **config server** is the only one TaskFlow can't start without. See [Running without the other services](#running-without-the-other-services).
 
 ## Tech stack
 
 - Java 25
-- Spring Boot 4.1 (Web MVC, Data JPA, Validation, Security, Artemis/JMS)
-- Spring Cloud 2025.1 (Netflix Eureka client)
+- Spring Boot 4.1 (Web MVC, Data JPA, Validation, Security, Artemis/JMS, Actuator)
+- Spring Cloud 2025.1 (Netflix Eureka client, Config client, Bus over AMQP)
+- Micrometer Tracing with a Zipkin exporter
 - Apache Artemis 2.53, embedded message broker
 - H2 in-memory database
 - Maven (the wrapper is included, so you don't need to install Maven)
@@ -49,8 +62,12 @@ flowchart LR
 
 - JDK 25 or newer
 - Ports **8080** (API) and **61616** (message broker) must be free.
+- The **config server** running at `http://localhost:8888`. TaskFlow fails to start without it.
+- Optional: the Eureka server (`:8761`), RabbitMQ (`:5672`) and Zipkin (`:9411`). TaskFlow runs without them, but logs connection errors.
 
 ### Run the application
+
+Start the config server first, then:
 
 ```bash
 # macOS / Linux / WSL
@@ -61,6 +78,19 @@ mvnw.cmd spring-boot:run
 ```
 
 The API starts at `http://localhost:8080`.
+
+### Run everything with Docker
+
+TaskFlow has a two-stage `Dockerfile`: it builds the jar with JDK 25 and runs it on a JRE 25 image that includes `curl` for health checks. Tests are skipped during the image build.
+
+To run TaskFlow together with all the other services and RabbitMQ, use the Compose setup in the sibling `taskflow-compose` folder:
+
+```bash
+cd ../taskflow-compose
+docker compose up -d --build
+```
+
+Compose starts the services in dependency order and points TaskFlow at the containers by name (`config-server`, `discovery-server`, `rabbitmq`) through environment variables. See `taskflow-compose/README.md` for details.
 
 ### Run the tests
 
@@ -88,12 +118,12 @@ These accounts are created when the app starts:
 
 > These passwords are for local development only. They are set in `DataSeeder.java`.
 
-| Request                                    | Who can do it            |
-|--------------------------------------------|--------------------------|
-| `GET /tasks`, `GET /tasks/{id}`            | Anyone, no login needed  |
-| `POST /tasks`, `PUT /tasks/{id}`           | Any logged-in user       |
-| `DELETE /tasks/{id}`                       | `ADMIN` only             |
-| Everything else (including the H2 console) | Any logged-in user       |
+| Request                                                     | Who can do it            |
+|-------------------------------------------------------------|--------------------------|
+| `GET /tasks`, `GET /tasks/{id}`                             | Anyone, no login needed  |
+| `POST /tasks`, `PUT /tasks/{id}`                            | Any logged-in user       |
+| `DELETE /tasks/{id}`                                        | `ADMIN` only             |
+| Everything else (including `/actuator/*`, `/internal/*` and the H2 console) | Any logged-in user |
 
 No login or a wrong password returns `401 Unauthorized`. Being logged in without permission, for example `alice` deleting a task, returns `403 Forbidden`.
 
@@ -122,6 +152,8 @@ All requests and responses use JSON.
 | `GET`    | `/tasks/{id}`       | —        | Get one task               | `200` + task  | `404`               |
 | `PUT`    | `/tasks/{id}`       | Any user | Update a task              | `200` + task  | `400`, `401`, `404` |
 | `DELETE` | `/tasks/{id}`       | Admin    | Delete a task              | `204` no body | `401`, `403`, `404` |
+
+For the configuration endpoints (`/actuator/refresh`, `/actuator/busrefresh` and `/internal/sampling-probability`), see [Changing settings without a restart](#changing-settings-without-a-restart).
 
 ### Request bodies
 
@@ -178,6 +210,22 @@ curl -u admin:adminpass -X DELETE http://localhost:8080/tasks/1
 
 On Windows PowerShell, use `curl.exe`, put each command on one line, and escape the inner quotes, for example `-d '{\"title\": \"Buy groceries\"}'`.
 
+## Correlation IDs
+
+Every request gets a correlation ID so you can follow it through the logs of TaskFlow and the services it talks to:
+
+- If the request has an `X-Correlation-Id` header, TaskFlow uses that value. The API gateway adds one to every request it forwards. Otherwise TaskFlow generates a random UUID.
+- TaskFlow sends the ID back in the response's `X-Correlation-Id` header.
+- The ID appears in every log line written while the request is handled, for example `INFO [3f1c9a2e-...]`. The log format comes from the shared setting `logging.pattern.level` on the config server.
+- The ID is attached to the task-created event, so the notification service can log the same ID. See [Task-created events](#task-created-events).
+
+```bash
+curl -i -H "X-Correlation-Id: demo-123" http://localhost:8080/tasks
+# Response includes: X-Correlation-Id: demo-123
+```
+
+This is done by `CorrelationIdFilter`. It runs after Spring Security, so a request rejected with `401` or `403` gets no correlation ID and no `X-Correlation-Id` response header.
+
 ## Task-created events
 
 After a task is saved, TaskFlow sends a message to the queue **`task.created.queue`** on the embedded Artemis broker. The message is a JMS text message:
@@ -187,6 +235,7 @@ After a task is saved, TaskFlow sends a message to the queue **`task.created.que
   { "taskId": 1, "title": "Buy groceries" }
   ```
 - **Property** `_type` = `task-created`, which tells consumers what kind of event it is.
+- **Property** `correlationId`, the correlation ID of the request that created the task.
 
 To receive events, another service connects to the broker at `tcp://localhost:61616` and listens on `task.created.queue`.
 
@@ -194,17 +243,80 @@ If the event can't be sent, TaskFlow logs a warning (`Failed to publish task-cre
 
 ## Service discovery (Eureka)
 
-On startup, TaskFlow registers with a Eureka server at `http://localhost:8761/eureka/` under the name `TASKFLOW`, then sends a heartbeat every 30 seconds. Other services can then look up TaskFlow by name instead of hard-coding its address.
+On startup, TaskFlow registers with a Eureka server at `http://localhost:8761/eureka/` under the name `TASKFLOW`, then sends a heartbeat every 30 seconds. Other services can then look up TaskFlow by name instead of hard-coding its address. For example, the API gateway forwards `/tasks/**` to `lb://TASKFLOW`.
 
-The Eureka server is a separate Spring Boot application with `spring-cloud-starter-netflix-eureka-server` and `@EnableEurekaServer`. It isn't included in this repository.
+The Eureka address is a shared setting that comes from the config server.
+
+## Configuration
+
+TaskFlow's settings come from two places.
+
+**Local settings**, in `src/main/resources/application.properties`:
+
+| Property                                  | Value                                         | Purpose                                         |
+|-------------------------------------------|-----------------------------------------------|-------------------------------------------------|
+| `spring.datasource.url`                   | `jdbc:h2:mem:taskflow`                        | In-memory database                              |
+| `spring.h2.console.enabled`               | `true`                                        | H2 web console at `/h2-console`                 |
+| `spring.artemis.mode`                     | `embedded`                                    | Run the message broker inside TaskFlow          |
+| `spring.artemis.embedded.queues`          | `task.created.queue`                          | Create the event queue at startup               |
+| `spring.config.import`                    | `optional:configserver:http://localhost:8888` | Load shared settings from the config server     |
+| `management.endpoints.web.exposure.include` | `refresh,busrefresh`                        | Make the two refresh endpoints reachable over HTTP |
+
+**Shared settings**, served by the config server from its `config/application.properties`. Every service that uses the config server gets these:
+
+| Property                                  | Example value                     | Purpose                                      |
+|-------------------------------------------|-----------------------------------|----------------------------------------------|
+| `eureka.client.service-url.defaultZone`   | `http://localhost:8761/eureka/`   | Where the Eureka server is                   |
+| `eureka.instance.hostname`                | `localhost`                       | Address TaskFlow registers with              |
+| `logging.pattern.level`                   | `%5p [%X{correlationId:-}]`       | Adds the correlation ID to each log line     |
+| `management.tracing.sampling.probability` | `0.5`                             | Share of requests that are traced to Zipkin  |
+
+Settings from the config server take priority over local ones with the same name. To give TaskFlow its own value for a shared setting, add a `taskflow.properties` file next to the shared one on the config server.
+
+The broker's TCP port (61616) is set in `JmsConfig.java`.
+
+## Changing settings without a restart
+
+Beans marked with `@RefreshScope` re-read their settings when a refresh is triggered. `ConfigProbeController` is one of these. It shows the current value of `management.tracing.sampling.probability`, so you can see a refresh take effect.
+
+| Method | Path                              | What it does                                                                    |
+|--------|-----------------------------------|---------------------------------------------------------------------------------|
+| `GET`  | `/internal/sampling-probability`  | Returns the current sampling probability, for example `0.5`                     |
+| `POST` | `/actuator/refresh`               | Reloads settings from the config server, in this TaskFlow instance only         |
+| `POST` | `/actuator/busrefresh`            | Reloads settings in every service connected to the bus, through RabbitMQ        |
+
+All three need a login.
+
+To try it:
+
+```bash
+# 1. Check the current value
+curl -u admin:adminpass http://localhost:8080/internal/sampling-probability
+
+# 2. Change management.tracing.sampling.probability in the config server's
+#    config/application.properties, then confirm the config server serves the new value
+curl http://localhost:8888/taskflow/default
+
+# 3. Tell TaskFlow to reload
+curl -u admin:adminpass -X POST http://localhost:8080/actuator/refresh
+# ["management.tracing.sampling.probability"]
+
+# 4. Check again: the new value, with no restart
+curl -u admin:adminpass http://localhost:8080/internal/sampling-probability
+```
+
+`/actuator/refresh` returns the names of the settings that changed. An empty list, `[]`, means the config server is serving the same values as before.
+
+Use `/actuator/busrefresh` instead to refresh all services at once. It needs RabbitMQ, and only services that have `spring-cloud-starter-bus-amqp` receive the refresh.
 
 ## Running without the other services
 
-TaskFlow starts and serves requests even if nothing else is running:
-
 | Missing service      | What happens                                                                                                  |
 |----------------------|---------------------------------------------------------------------------------------------------------------|
+| Config server        | **TaskFlow doesn't start.** `ConfigProbeController` needs `management.tracing.sampling.probability`, which only the config server provides, so startup fails with `Could not resolve placeholder`. |
 | Eureka server        | `Connection refused ... localhost:8761` stack traces in the log every 30 seconds. The API works normally.      |
+| RabbitMQ             | Connection errors in the log. The API and `/actuator/refresh` work. `/actuator/busrefresh` doesn't.           |
+| Zipkin               | Warnings in the log when trace data can't be sent. The API works normally.                                     |
 | Event consumer       | Events stay on `task.created.queue` until something reads them. They're lost when the app stops.              |
 
 To hide the Eureka errors while you develop without a Eureka server, add this to `application.properties`:
@@ -213,36 +325,25 @@ To hide the Eureka errors while you develop without a Eureka server, add this to
 eureka.client.enabled=false
 ```
 
-## Configuration
-
-Settings in `src/main/resources/application.properties`:
-
-| Property                                  | Value                             | Purpose                                      |
-|-------------------------------------------|-----------------------------------|----------------------------------------------|
-| `spring.datasource.url`                   | `jdbc:h2:mem:taskflow`            | In-memory database                           |
-| `spring.h2.console.enabled`               | `true`                            | H2 web console at `/h2-console`              |
-| `spring.artemis.mode`                     | `embedded`                        | Run the message broker inside TaskFlow       |
-| `spring.artemis.embedded.queues`          | `task.created.queue`              | Create the event queue at startup            |
-| `eureka.client.service-url.defaultZone`   | `http://localhost:8761/eureka/`   | Where the Eureka server is                   |
-| `eureka.instance.hostname`                | `localhost`                       | Address TaskFlow registers with              |
-
-The broker's TCP port (61616) is set in `JmsConfig.java`.
-
 ## Known issues
 
+- **TaskFlow can't start without the config server**, even though the import is marked `optional:`. Giving the probe setting a default, such as `@Value("${management.tracing.sampling.probability:0.1}")`, would let it start on local settings alone.
+- **Any logged-in user can trigger a refresh.** `/actuator/*` falls under "any logged-in user", so `alice` can call `/actuator/refresh` and `/actuator/busrefresh`. Restricting `/actuator/**` to `ADMIN` would fix this.
 - **The H2 console doesn't work in a browser.** `/h2-console` requires a TaskFlow login. Even after you log in, Spring Security's default `X-Frame-Options: DENY` header stops the console's page frames from loading. Using it would need a security rule that allows `/h2-console/**` and same-origin frames. The connection details are JDBC URL `jdbc:h2:mem:taskflow`, user `sa`, and an empty password.
 - **Undelivered events are lost when the app stops.** The broker is embedded, so it stops with TaskFlow.
 
 ## Project structure
 
 ```
+Dockerfile                                # Two-stage image build (JDK 25 build, JRE 25 runtime)
 src/main/java/com/taskflow/
 ├── TaskflowApplication.java              # Application entry point
 ├── controller/TaskController.java        # REST endpoints
 ├── service/TaskService.java              # Business logic; publishes an event after create
 ├── client/
-│   ├── NotificationClient.java           # Sends task-created events to the JMS queue
+│   ├── NotificationClient.java           # Sends task-created events (with correlation ID) to the JMS queue
 │   └── TaskCreatedEvent.java             # Event payload (taskId, title)
+├── filter/CorrelationIdFilter.java       # Reads or creates X-Correlation-Id and puts it in the logs
 ├── repository/
 │   ├── TaskRepository.java               # Task storage, including findByDone
 │   └── UserRepository.java               # User lookup by username
@@ -260,7 +361,8 @@ src/main/java/com/taskflow/
     ├── SecurityConfig.java               # Access rules, HTTP Basic, password hashing
     ├── TaskFlowUserDetailsService.java   # Loads users from the database for login
     ├── DataSeeder.java                   # Creates the admin and alice accounts at startup
-    └── JmsConfig.java                    # JSON message format and broker TCP port
+    ├── JmsConfig.java                    # JSON message format and broker TCP port
+    └── ConfigProbeController.java        # Shows a refreshable setting at /internal/sampling-probability
 ```
 
-A request goes through Spring Security first, which checks the login and the access rules. It then goes from the controller to the service, and from the service to the repository, which reads and writes the database. After a task is created, the service calls `NotificationClient`, which publishes the event to the queue. Errors are turned into JSON responses by `GlobalExceptionHandler`. Passwords are stored as BCrypt hashes, never as plain text.
+A request goes through Spring Security first, which checks the login and the access rules. `CorrelationIdFilter` then sets its correlation ID. The request goes from the controller to the service, and from the service to the repository, which reads and writes the database. After a task is created, the service calls `NotificationClient`, which publishes the event to the queue. Errors are turned into JSON responses by `GlobalExceptionHandler`. Passwords are stored as BCrypt hashes, never as plain text.
